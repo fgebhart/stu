@@ -10,6 +10,7 @@ With STU, you can browse buckets and objects directly from your terminal, previe
 
 - Recursive object downloads  
 - Previews with syntax highlighting for text files and inline rendering for images  
+- Parquet footer previews via byte-range requests, without downloading the whole file  
 - Access to previous object versions  
 - Customizable key bindings  
 - Support for S3-compatible storage  

@@ -13,6 +13,7 @@ mod keys;
 mod macros;
 mod object;
 mod pages;
+mod parquet_footer;
 mod run;
 mod util;
 mod widget;

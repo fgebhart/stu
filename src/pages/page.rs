@@ -4,10 +4,10 @@ use ratatui::{crossterm::event::KeyEvent, layout::Rect, Frame};
 
 use crate::{
     app::AppContext,
-    event::Sender,
+    event::{PreviewContent, Sender},
     help::{Spans, SpansWithPriority},
     keys::{UserEvent, UserEventMapper},
-    object::{BucketItem, FileDetail, ObjectItem, ObjectKey, RawObject},
+    object::{BucketItem, FileDetail, ObjectItem, ObjectKey},
     pages::{
         bucket_list::BucketListPage, help::HelpPage, initializing::InitializingPage,
         object_detail::ObjectDetailPage, object_list::ObjectListPage,
@@ -118,14 +118,14 @@ impl Page {
     pub fn of_object_preview(
         file_detail: FileDetail,
         file_version_id: Option<String>,
-        object: RawObject,
+        content: PreviewContent,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
         Self::ObjectPreview(Box::new(ObjectPreviewPage::new(
             file_detail,
             file_version_id,
-            object,
+            content,
             ctx,
             tx,
         )))

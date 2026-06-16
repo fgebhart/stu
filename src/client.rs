@@ -291,6 +291,43 @@ impl Client {
         Ok(())
     }
 
+    /// Downloads a byte range of an object and returns the collected bytes.
+    ///
+    /// `start` and `end` are both inclusive byte offsets, matching the
+    /// semantics of the HTTP `Range: bytes=start-end` header.
+    pub async fn download_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>> {
+        let mut request = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(format!("bytes={start}-{end}"));
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id);
+        }
+
+        let result = request.send().await;
+        let output = result.map_err(|e| AppError::new("Failed to download object range", e))?;
+
+        let mut bytes = Vec::with_capacity((end - start + 1) as usize);
+        let mut stream = output.body;
+        while let Some(buf) = stream
+            .try_next()
+            .await
+            .map_err(|e| AppError::new("Failed to collect body", e))?
+        {
+            bytes.extend_from_slice(&buf);
+        }
+        Ok(bytes)
+    }
+
     pub async fn list_all_download_objects(
         &self,
         bucket: &str,

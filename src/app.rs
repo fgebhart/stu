@@ -24,7 +24,7 @@ use crate::{
         CompleteInitializeResult, CompleteLoadAllDownloadObjectListResult,
         CompleteLoadObjectDetailResult, CompleteLoadObjectVersionsResult,
         CompleteLoadObjectsResult, CompletePreviewObjectResult, CompleteReloadBucketsResult,
-        CompleteReloadObjectsResult, CompleteSaveObjectResult, Sender,
+        CompleteReloadObjectsResult, CompleteSaveObjectResult, PreviewContent, Sender,
     },
     file::{copy_image_to_clipboard, copy_text_to_clipboard, create_binary_file, save_error_log},
     keys::UserEventMapper,
@@ -32,6 +32,8 @@ use crate::{
         AppObjects, BucketItem, DownloadObjectInfo, FileDetail, ObjectItem, ObjectKey, RawObject,
     },
     pages::page::{Page, PageStack},
+    parquet_footer::{self, FooterParseResult},
+    util::extension_from_file_name,
     widget::{Header, LoadingDialog, Status, StatusType},
 };
 
@@ -801,6 +803,11 @@ impl App {
         file_detail: FileDetail,
         version_id: Option<String>,
     ) {
+        if extension_from_file_name(&file_detail.name).eq_ignore_ascii_case("parquet") {
+            self.preview_parquet_footer(object_key, file_detail, version_id);
+            return;
+        }
+
         let size_byte = file_detail.size_byte;
 
         let bucket = object_key.bucket_name.clone();
@@ -818,8 +825,34 @@ impl App {
                     .download_object(&bucket, &key, version_id.clone(), &mut writer, loading)
                     .await
             };
-            let obj = result.map(|_| RawObject { bytes });
-            let result = CompletePreviewObjectResult::new(obj, file_detail, version_id);
+            let content = result.map(|_| PreviewContent::Raw(RawObject { bytes }));
+            let result = CompletePreviewObjectResult::new(content, file_detail, version_id);
+            tx.send(AppEventType::CompletePreviewObject(result));
+        });
+    }
+
+    /// Fetches only the footer of a parquet object using byte-range requests
+    /// and builds a textual preview of its metadata, avoiding a full download.
+    fn preview_parquet_footer(
+        &self,
+        object_key: ObjectKey,
+        file_detail: FileDetail,
+        version_id: Option<String>,
+    ) {
+        let file_size = file_detail.size_byte as u64;
+
+        let bucket = object_key.bucket_name.clone();
+        let key = object_key.joined_object_path(true);
+
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+
+        spawn(async move {
+            let content =
+                fetch_parquet_footer(&client, &bucket, &key, version_id.clone(), file_size)
+                    .await
+                    .map(PreviewContent::Parquet);
+            let result = CompletePreviewObjectResult::new(content, file_detail, version_id);
             tx.send(AppEventType::CompletePreviewObject(result));
         });
     }
@@ -827,14 +860,14 @@ impl App {
     pub fn complete_preview_object(&mut self, result: Result<CompletePreviewObjectResult>) {
         match result {
             Ok(CompletePreviewObjectResult {
-                obj,
+                content,
                 file_detail,
                 file_version_id,
             }) => {
                 let object_preview_page = Page::of_object_preview(
                     file_detail,
                     file_version_id,
-                    obj,
+                    content,
                     Rc::clone(&self.ctx),
                     self.tx.clone(),
                 );
@@ -1066,6 +1099,49 @@ impl App {
         if self.loading() {
             let dialog = LoadingDialog::default().theme(self.ctx.theme());
             f.render_widget(dialog, f.area());
+        }
+    }
+}
+
+/// Fetches the parquet footer using byte-range requests, retrying with a larger
+/// suffix when the parser indicates more data is required, and returns the
+/// formatted metadata lines.
+async fn fetch_parquet_footer(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: Option<String>,
+    file_size: u64,
+) -> Result<Vec<String>> {
+    if file_size == 0 {
+        return Err(AppError::msg("Cannot preview footer of an empty file"));
+    }
+
+    let mut fetch_size = parquet_footer::INITIAL_FOOTER_FETCH_SIZE.min(file_size);
+    loop {
+        let start = file_size - fetch_size;
+        let bytes = client
+            .download_object_range(bucket, key, version_id.clone(), start, file_size - 1)
+            .await?;
+
+        match parquet_footer::parse_footer(&bytes, file_size) {
+            FooterParseResult::Parsed(metadata) => {
+                return Ok(parquet_footer::format_metadata(&metadata, file_size));
+            }
+            FooterParseResult::NeedMoreBytes(needed) => {
+                let needed = needed as u64;
+                // Guard against a parser that keeps asking for more without
+                // making progress, or for more than the whole file.
+                if needed <= fetch_size || needed > file_size {
+                    return Err(AppError::msg("Failed to parse parquet footer"));
+                }
+                fetch_size = needed;
+            }
+            FooterParseResult::Failed(msg) => {
+                return Err(AppError::msg(format!(
+                    "Failed to parse parquet footer: {msg}"
+                )));
+            }
         }
     }
 }

@@ -4,6 +4,8 @@
   - It must be enabled in the [config](../configurations/config-file-format.md#previewhighlight)
 - Image preview
   - It must be enabled in the [config](../configurations/config-file-format.md#previewimage)
+- Parquet footer preview
+  - For `.parquet` objects, only the file footer is fetched using byte-range requests (the whole object is not downloaded), and the parsed metadata (schema, row groups, column chunks, key/value metadata) is shown
 - Open with encoding
   - Available encodings can be specified in the [config](../configurations/config-file-format.md#previewencodings)
   - Automatic encoding detection (guessing)

@@ -5,7 +5,7 @@ use ratatui::{crossterm::event::KeyEvent, layout::Rect, Frame};
 use crate::{
     app::AppContext,
     environment::ImagePicker,
-    event::{AppEventType, Sender},
+    event::{AppEventType, PreviewContent, Sender},
     handle_user_events, handle_user_events_with_default,
     help::{
         build_help_spans, build_short_help_spans, BuildHelpsItem, BuildShortHelpsItem, Spans,
@@ -15,7 +15,7 @@ use crate::{
     object::{FileDetail, RawObject},
     widget::{
         self, EncodingDialog, EncodingDialogState, ImagePreview, ImagePreviewState, InputDialog,
-        InputDialogState, TextPreview, TextPreviewState,
+        InputDialogState, ParquetPreview, ParquetPreviewState, TextPreview, TextPreviewState,
     },
 };
 
@@ -25,7 +25,9 @@ pub struct ObjectPreviewPage {
 
     file_detail: FileDetail,
     file_version_id: Option<String>,
-    object: Arc<RawObject>,
+    // `None` for previews that do not hold the full object in memory (e.g. the
+    // parquet footer preview, which only fetches the footer).
+    object: Option<Arc<RawObject>>,
 
     view_state: ViewState,
     encoding_dialog_state: EncodingDialogState,
@@ -38,6 +40,7 @@ pub struct ObjectPreviewPage {
 enum PreviewType {
     Text(TextPreviewState),
     Image(ImagePreviewState),
+    Parquet(ParquetPreviewState),
 }
 
 #[derive(Debug, Default)]
@@ -52,40 +55,49 @@ impl ObjectPreviewPage {
     pub fn new(
         file_detail: FileDetail,
         file_version_id: Option<String>,
-        object: RawObject,
+        content: PreviewContent,
         ctx: Rc<AppContext>,
         tx: Sender,
     ) -> Self {
         let mut encoding_dialog_state = EncodingDialogState::new(&ctx.config.preview.encodings);
 
-        let preview_type = if infer::is_image(&object.bytes) {
-            let (state, msg) =
-                ImagePreviewState::new(&object.bytes, ctx.env.image_picker.clone().into());
-            if let Some(msg) = msg {
-                tx.send(AppEventType::NotifyWarn(msg));
+        let (preview_type, object) = match content {
+            PreviewContent::Parquet(lines) => {
+                let state = ParquetPreviewState::new(lines);
+                (PreviewType::Parquet(state), None)
             }
-            PreviewType::Image(state)
-        } else {
-            let (state, guessed_encoding, msg) = TextPreviewState::new(
-                &file_detail,
-                &object,
-                ctx.config.preview.highlight,
-                &ctx.config.preview.highlight_theme,
-                ctx.config.preview.auto_detect_encoding,
-                encoding_dialog_state.selected(),
-            );
-            if let Some(msg) = msg {
-                tx.send(AppEventType::NotifyWarn(msg));
+            PreviewContent::Raw(object) => {
+                let preview_type = if infer::is_image(&object.bytes) {
+                    let (state, msg) =
+                        ImagePreviewState::new(&object.bytes, ctx.env.image_picker.clone().into());
+                    if let Some(msg) = msg {
+                        tx.send(AppEventType::NotifyWarn(msg));
+                    }
+                    PreviewType::Image(state)
+                } else {
+                    let (state, guessed_encoding, msg) = TextPreviewState::new(
+                        &file_detail,
+                        &object,
+                        ctx.config.preview.highlight,
+                        &ctx.config.preview.highlight_theme,
+                        ctx.config.preview.auto_detect_encoding,
+                        encoding_dialog_state.selected(),
+                    );
+                    if let Some(msg) = msg {
+                        tx.send(AppEventType::NotifyWarn(msg));
+                    }
+                    if let Some(guessed_encoding) = guessed_encoding {
+                        encoding_dialog_state.add_guessed_encoding(guessed_encoding);
+                    }
+                    PreviewType::Text(state)
+                };
+                (preview_type, Some(Arc::new(object)))
             }
-            if let Some(guessed_encoding) = guessed_encoding {
-                encoding_dialog_state.add_guessed_encoding(guessed_encoding);
-            }
-            PreviewType::Text(state)
         };
 
         Self {
             preview_type,
-            object: Arc::new(object),
+            object,
             file_detail,
             file_version_id,
             view_state: ViewState::Default,
@@ -170,6 +182,49 @@ impl ObjectPreviewPage {
                     }
                 }
             }
+            (ViewState::Default, PreviewType::Parquet(state)) => {
+                handle_user_events! { user_events =>
+                    UserEvent::ObjectPreviewBack => {
+                        self.tx.send(AppEventType::CloseCurrentPage);
+                    }
+                    UserEvent::ObjectPreviewDown => {
+                        state.scroll_lines_state.scroll_forward();
+                    }
+                    UserEvent::ObjectPreviewUp => {
+                        state.scroll_lines_state.scroll_backward();
+                    }
+                    UserEvent::ObjectPreviewPageDown => {
+                        state.scroll_lines_state.scroll_page_forward();
+                    }
+                    UserEvent::ObjectPreviewPageUp => {
+                        state.scroll_lines_state.scroll_page_backward();
+                    }
+                    UserEvent::ObjectPreviewGoToTop => {
+                        state.scroll_lines_state.scroll_to_top();
+                    }
+                    UserEvent::ObjectPreviewGoToBottom => {
+                        state.scroll_lines_state.scroll_to_end();
+                    }
+                    UserEvent::ObjectPreviewLeft => {
+                        state.scroll_lines_state.scroll_left();
+                    }
+                    UserEvent::ObjectPreviewRight => {
+                        state.scroll_lines_state.scroll_right();
+                    }
+                    UserEvent::ObjectPreviewToggleWrap => {
+                        state.scroll_lines_state.toggle_wrap();
+                    }
+                    UserEvent::ObjectPreviewToggleNumber => {
+                        state.scroll_lines_state.toggle_number();
+                    }
+                    UserEvent::ObjectPreviewCopy => {
+                        self.copy_parquet_content();
+                    }
+                    UserEvent::Help => {
+                        self.tx.send(AppEventType::OpenHelp);
+                    }
+                }
+            }
             (ViewState::SaveDialog(state), _) => {
                 handle_user_events_with_default! { user_events =>
                     UserEvent::InputDialogClose => {
@@ -230,6 +285,15 @@ impl ObjectPreviewPage {
                 );
                 f.render_stateful_widget(preview, area, state);
             }
+            PreviewType::Parquet(ref mut state) => {
+                let preview = ParquetPreview::new(
+                    self.file_detail.name.as_str(),
+                    self.file_version_id.as_deref(),
+                    &self.ctx.env,
+                    self.ctx.theme(),
+                );
+                f.render_stateful_widget(preview, area, state);
+            }
         }
 
         if let ViewState::SaveDialog(state) = &mut self.view_state {
@@ -282,6 +346,23 @@ impl ObjectPreviewPage {
                     BuildHelpsItem::new(UserEvent::ObjectPreviewCopy, "Copy content to clipboard"),
                 ]
             },
+            (ViewState::Default, PreviewType::Parquet(_)) => {
+                vec![
+                    BuildHelpsItem::new(UserEvent::Quit, "Quit app"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewDown, "Scroll forward"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewUp, "Scroll backward"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewPageDown, "Scroll page forward"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewPageUp, "Scroll page backward"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewGoToTop, "Scroll to top"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewGoToBottom, "Scroll to end"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewLeft, "Scroll left"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewRight, "Scroll right"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewToggleWrap, "Toggle wrap"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewToggleNumber, "Toggle number"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewBack, "Close preview"),
+                    BuildHelpsItem::new(UserEvent::ObjectPreviewCopy, "Copy content to clipboard"),
+                ]
+            },
             (ViewState::SaveDialog(_), _) => {
                 vec![
                     BuildHelpsItem::new(UserEvent::Quit, "Quit app"),
@@ -326,6 +407,16 @@ impl ObjectPreviewPage {
                     BuildShortHelpsItem::single(UserEvent::Help, "Help", 0),
                 ]
             },
+            (ViewState::Default, PreviewType::Parquet(_)) => {
+                vec![
+                    BuildShortHelpsItem::single(UserEvent::Quit, "Quit", 0),
+                    BuildShortHelpsItem::group(vec![UserEvent::ObjectPreviewDown, UserEvent::ObjectPreviewUp], "Scroll", 2),
+                    BuildShortHelpsItem::group(vec![UserEvent::ObjectPreviewGoToTop, UserEvent::ObjectPreviewGoToBottom], "Top/End", 4),
+                    BuildShortHelpsItem::single(UserEvent::ObjectPreviewCopy, "Copy", 3),
+                    BuildShortHelpsItem::single(UserEvent::ObjectPreviewBack, "Close", 1),
+                    BuildShortHelpsItem::single(UserEvent::Help, "Help", 0),
+                ]
+            },
             (ViewState::SaveDialog(_), _) => {
                 vec![
                     BuildShortHelpsItem::single(UserEvent::InputDialogClose, "Close", 2),
@@ -353,14 +444,23 @@ impl ObjectPreviewPage {
     }
 
     fn copy_text_content(&mut self) {
-        if let PreviewType::Text(state) = &self.preview_type {
+        if let (PreviewType::Text(state), Some(object)) = (&self.preview_type, &self.object) {
             let encoding: &encoding_rs::Encoding = state.encoding.into();
-            let (content, _, _) = encoding.decode(&self.object.bytes);
+            let (content, _, _) = encoding.decode(&object.bytes);
             let content_string = content.into_owned();
 
             self.tx.send(AppEventType::CopyTextToClipboard(
                 self.file_detail.name.clone(),
                 content_string,
+            ));
+        }
+    }
+
+    fn copy_parquet_content(&mut self) {
+        if let PreviewType::Parquet(state) = &self.preview_type {
+            self.tx.send(AppEventType::CopyTextToClipboard(
+                self.file_detail.name.clone(),
+                state.text().to_string(),
             ));
         }
     }
@@ -393,11 +493,12 @@ impl ObjectPreviewPage {
 
     fn apply_encoding(&mut self) {
         if let ViewState::EncodingDialog = &self.view_state {
-            if let PreviewType::Text(state) = &mut self.preview_type {
+            if let (PreviewType::Text(state), Some(object)) = (&mut self.preview_type, &self.object)
+            {
                 state.set_encoding(self.encoding_dialog_state.selected());
                 state.update_lines(
                     &self.file_detail,
-                    &self.object,
+                    object,
                     self.ctx.config.preview.highlight,
                     &self.ctx.config.preview.highlight_theme,
                 );
@@ -423,10 +524,12 @@ impl ObjectPreviewPage {
     }
 
     fn download(&self) {
-        self.tx.send(AppEventType::StartSaveObject(
-            self.file_detail.name.clone(),
-            Arc::clone(&self.object),
-        ));
+        if let Some(object) = &self.object {
+            self.tx.send(AppEventType::StartSaveObject(
+                self.file_detail.name.clone(),
+                Arc::clone(object),
+            ));
+        }
     }
 
     fn download_as(&mut self, input: String) {
@@ -435,10 +538,10 @@ impl ObjectPreviewPage {
             return;
         }
 
-        self.tx.send(AppEventType::StartSaveObject(
-            input,
-            Arc::clone(&self.object),
-        ));
+        if let Some(object) = &self.object {
+            self.tx
+                .send(AppEventType::StartSaveObject(input, Arc::clone(object)));
+        }
 
         self.close_save_dialog();
     }
@@ -483,7 +586,8 @@ mod tests {
                 "Thank you!",
             ];
             let object = object(&preview);
-            let mut page = ObjectPreviewPage::new(file_detail, None, object, ctx, tx);
+            let mut page =
+                ObjectPreviewPage::new(file_detail, None, PreviewContent::Raw(object), ctx, tx);
             let area = Rect::new(0, 0, 30, 10);
             page.render(f, area);
         })?;
@@ -520,7 +624,8 @@ mod tests {
             let file_detail = file_detail();
             let preview = ["Hello, world!"; 20];
             let object = object(&preview);
-            let mut page = ObjectPreviewPage::new(file_detail, None, object, ctx, tx);
+            let mut page =
+                ObjectPreviewPage::new(file_detail, None, PreviewContent::Raw(object), ctx, tx);
             let area = Rect::new(0, 0, 30, 10);
             page.render(f, area);
         })?;
@@ -562,7 +667,8 @@ mod tests {
                 "Thank you!",
             ];
             let object = object(&preview);
-            let mut page = ObjectPreviewPage::new(file_detail, None, object, ctx, tx);
+            let mut page =
+                ObjectPreviewPage::new(file_detail, None, PreviewContent::Raw(object), ctx, tx);
             page.open_save_dialog();
             let area = Rect::new(0, 0, 30, 10);
             page.render(f, area);
@@ -583,6 +689,48 @@ mod tests {
         ]);
         set_cells! { expected =>
             ([2], 1..3) => fg: Color::DarkGray,
+        }
+
+        terminal.backend().assert_buffer(&expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_render_parquet_footer_preview() -> Result<(), core::convert::Infallible> {
+        let ctx = Rc::default();
+        let tx = sender();
+        let mut terminal = setup_terminal()?;
+
+        terminal.draw(|f| {
+            let mut file_detail = file_detail();
+            file_detail.name = "data.parquet".to_string();
+            let lines = vec![
+                "[File]".to_string(),
+                "  Num rows:       3".to_string(),
+                "  Num row groups: 1".to_string(),
+            ];
+            let mut page =
+                ObjectPreviewPage::new(file_detail, None, PreviewContent::Parquet(lines), ctx, tx);
+            let area = Rect::new(0, 0, 30, 10);
+            page.render(f, area);
+        })?;
+
+        #[rustfmt::skip]
+        let mut expected = Buffer::with_lines([
+            "┌Footer [data.parquet]───────┐",
+            "│ 1 [File]                   │",
+            "│ 2   Num rows:       3      │",
+            "│ 3   Num row groups: 1      │",
+            "│                            │",
+            "│                            │",
+            "│                            │",
+            "│                            │",
+            "│                            │",
+            "└────────────────────────────┘",
+        ]);
+        set_cells! { expected =>
+            ([2], [1, 2, 3]) => fg: Color::DarkGray,
         }
 
         terminal.backend().assert_buffer(&expected);

@@ -217,22 +217,31 @@ impl CompleteDownloadObjectsResult {
     }
 }
 
+/// The content to be shown in the object preview page.
+#[derive(Debug)]
+pub enum PreviewContent {
+    /// Raw object bytes, previewed as text or an image.
+    Raw(RawObject),
+    /// Pre-formatted lines of a parquet file's footer metadata.
+    Parquet(Vec<String>),
+}
+
 #[derive(Debug)]
 pub struct CompletePreviewObjectResult {
-    pub obj: RawObject,
+    pub content: PreviewContent,
     pub file_detail: FileDetail,
     pub file_version_id: Option<String>,
 }
 
 impl CompletePreviewObjectResult {
     pub fn new(
-        obj: Result<RawObject>,
+        content: Result<PreviewContent>,
         file_detail: FileDetail,
         file_version_id: Option<String>,
     ) -> Result<CompletePreviewObjectResult> {
-        let obj = obj?;
+        let content = content?;
         Ok(CompletePreviewObjectResult {
-            obj,
+            content,
             file_detail,
             file_version_id,
         })
